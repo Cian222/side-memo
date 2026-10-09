@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "侧边备忘录默认能力",
+  "windows": ["sidebar"],
+  "permissions": ["core:default"]
+}
