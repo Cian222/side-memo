@@ -223,11 +223,47 @@ fn place_sliver(d: &Dock, win: &WebviewWindow, mon: &Monitor, sliver: i32) {
     clear_region(win);
 }
 
+/// 剥掉窗口样式里的标题栏位（WS_CAPTION/WS_SYSMENU）。
+/// decorations:false 只是拦截非客户区绘制，样式位还在；一旦发生非客户区
+/// 重算（SetWindowRgn 会触发），Win11 会把原生标题栏连同 ─ □ ✕ 画出来，
+/// 半透明地叠在我们的自绘标题上。剥掉样式位后系统再无标题栏可画。
+#[cfg(windows)]
+fn strip_caption_style(win: &WebviewWindow) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_SYSMENU,
+    };
+    let Ok(hwnd) = win.hwnd() else { return };
+    let ptr = hwnd.0 as isize as *mut core::ffi::c_void;
+    unsafe {
+        let style = GetWindowLongPtrW(ptr, GWL_STYLE);
+        let cleaned = style & !(WS_CAPTION as isize) & !(WS_SYSMENU as isize);
+        if cleaned != style {
+            SetWindowLongPtrW(ptr, GWL_STYLE, cleaned);
+            // 通知系统重新计算非客户区
+            SetWindowPos(
+                ptr,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_caption_style(_win: &WebviewWindow) {}
+
 pub fn init(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
     let win = handle
         .get_webview_window(WIN_LABEL)
         .ok_or("main window not found")?;
+    // 先剥掉原生标题栏样式位（防区域裁剪触发非客户区重算时透出系统底框）
+    strip_caption_style(&win);
     let mon = handle.primary_monitor()?.ok_or("no primary monitor")?;
 
     let cfg = store_json(&handle);
@@ -282,6 +318,8 @@ pub fn init(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     if first_run {
         let _ = win.set_focus();
     }
+    // 挪位/放尺寸/show 过程中 tao 可能重写窗口样式把标题栏位加回来，收尾再剥一次
+    strip_caption_style(&win);
 
     handle.manage(Dock {
         state: Mutex::new(if expanded_start {
@@ -408,6 +446,7 @@ fn animate_edge(app: &AppHandle, win: &WebviewWindow, mon: &Monitor, expanding: 
         clip_region(win, if side_left { 0 } else { full_w }, if side_left { 0 } else { full_w }, mon_h);
         let _ = win.set_position(PhysicalPosition::new(full_x, mon_y));
         let _ = win.set_size(PhysicalSize::new(full_w as u32, mon_h as u32));
+        strip_caption_style(win);
         for step in 1..=ANIM_STEPS {
             let t = step as f64 / ANIM_STEPS as f64;
             let eased = 1.0 - (1.0 - t) * (1.0 - t);
@@ -504,6 +543,7 @@ pub fn show_expanded(app: &AppHandle, focus: bool) {
             // 从隐藏/收起状态唤出：先挪到展开位再放尺寸（中间态不出屏），取消区域并强制重绘
             let _ = win.set_position(PhysicalPosition::new(x, mon_y));
             let _ = win.set_size(PhysicalSize::new(full_w as u32, mon.size().height));
+            strip_caption_style(&win);
             clear_region(&win);
             redraw_window(&win);
         }
