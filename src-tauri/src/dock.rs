@@ -182,35 +182,45 @@ fn clear_region(win: &WebviewWindow) {
     }
 }
 
+/// 强制整窗（含 WebView2 子窗口）重绘：取消区域裁剪后，
+/// WebView2 不会主动重绘先前被裁掉的部位，会留下透出桌面的洞
+#[cfg(windows)]
+fn redraw_window(win: &WebviewWindow) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+    };
+    let Ok(hwnd) = win.hwnd() else { return };
+    unsafe {
+        RedrawWindow(
+            hwnd.0 as _,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn redraw_window(_win: &WebviewWindow) {}
+
 #[cfg(not(windows))]
 fn clip_region(_win: &WebviewWindow, _l: i32, _r: i32, _h: i32) {}
 
 #[cfg(not(windows))]
 fn clear_region(_win: &WebviewWindow) {}
 
-/// 把窗口调到展开尺寸（按 Dock 记录的逻辑宽度 × 目标屏缩放，高度=屏幕高），返回物理宽度
-fn ensure_full_size(d: &Dock, win: &WebviewWindow, mon: &Monitor) -> i32 {
-    let width_l = d.width_l.load(Ordering::Relaxed) as f64;
-    let want_w = ((width_l * mon.scale_factor()).round() as u32).max(1);
-    let want_h = mon.size().height;
-    let Ok(size) = win.outer_size() else {
-        return want_w as i32;
-    };
-    if size.width != want_w || size.height != want_h {
-        let _ = win.set_size(PhysicalSize::new(want_w, want_h));
-    }
-    want_w as i32
-}
-
-/// 收起状态重摆：位置贴边 + 区域只留边条（不改窗口尺寸）
+/// 收起状态重摆：窗口物理收窄到边条宽度并贴边停放。
+/// 静止状态不依赖区域裁剪——纯裁剪挡不住 WebView2 子窗口在相邻屏上的鼠标命中
 fn place_sliver(d: &Dock, win: &WebviewWindow, mon: &Monitor, sliver: i32) {
     let side_left = d.side_left.load(Ordering::Relaxed);
     let mon_x = mon.position().x;
     let mon_y = mon.position().y;
     let mon_w = mon.size().width as i32;
+    // 先缩后挪：两个中间态都不会越出屏幕
+    let _ = win.set_size(PhysicalSize::new(sliver.max(1) as u32, mon.size().height));
     let x = if side_left { mon_x } else { mon_x + mon_w - sliver };
     let _ = win.set_position(PhysicalPosition::new(x, mon_y));
-    clip_region(win, 0, sliver, mon.size().height as i32);
+    clear_region(win);
 }
 
 pub fn init(app: &App) -> Result<(), Box<dyn std::error::Error>> {
@@ -256,24 +266,19 @@ pub fn init(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let mon_y = mon.position().y;
     let mon_w = mon.size().width as i32;
 
-    // 首次使用 / 固定状态：直接展开；否则收起成边条
+    // 首次使用 / 固定状态：直接展开（先挪位后放尺寸）；否则物理收窄成边条（先缩后挪）
     let first_run = !store_exists(&handle);
     let expanded_start = first_run || pin;
-    let x = if expanded_start {
-        if side_left { mon_x } else { mon_x + mon_w - width_px }
-    } else if side_left {
-        mon_x
-    } else {
-        mon_x + mon_w - sliver
-    };
-    let _ = win.set_size(PhysicalSize::new(width_px as u32, height));
-    let _ = win.set_position(PhysicalPosition::new(x, mon_y));
-    let _ = win.show();
     if expanded_start {
-        clear_region(&win);
+        let x = if side_left { mon_x } else { mon_x + mon_w - width_px };
+        let _ = win.set_position(PhysicalPosition::new(x, mon_y));
+        let _ = win.set_size(PhysicalSize::new(width_px as u32, height));
     } else {
-        clip_region(&win, 0, sliver, height as i32);
+        let x = if side_left { mon_x } else { mon_x + mon_w - sliver };
+        let _ = win.set_size(PhysicalSize::new(sliver.max(1) as u32, height));
+        let _ = win.set_position(PhysicalPosition::new(x, mon_y));
     }
+    let _ = win.show();
     if first_run {
         let _ = win.set_focus();
     }
@@ -374,36 +379,57 @@ fn poll_loop(app: AppHandle) {
     }
 }
 
-/// 展开/收起动画：右吸边=窗口从右缘滑出/滑入，左吸边=窗口固定在左缘用区域揭示/收拢；
-/// 逐帧用窗口区域在屏幕边缘处裁断，窗口尺寸全程不变（WebView 不重排，不透底不花屏）
+/// 展开/收起动画。窗口全程停在所在屏的展开矩形内（矩形本身不出屏，
+/// 即使区域裁剪完全失效也不会压到相邻屏）：
+/// - 展开前：先整窗遮住，再摆到展开位并还原全尺寸——尺寸切换与网页重排
+///   都在不可见时完成，取消遮蔽时 WebView 已是画好的完整画面（修"透洞"）
+/// - 动画中：只改窗口区域，从吸边一侧揭示/收拢，位置与尺寸都不动
+/// - 收起后：物理收窄到边条宽度贴边停放，静止不依赖区域
 fn animate_edge(app: &AppHandle, win: &WebviewWindow, mon: &Monitor, expanding: bool) {
     let d = app.state::<Dock>().inner();
     let side_left = d.side_left.load(Ordering::Relaxed);
     let width_l = d.width_l.load(Ordering::Relaxed) as f64;
     let sliver_w = d.sliver.load(Ordering::Relaxed).max(1);
     let full_w = ((width_l * mon.scale_factor()).round() as i32).max(sliver_w);
-    let mon_x = mon.position().x;
-    let mon_y = mon.position().y;
-    let mon_w = mon.size().width as i32;
-    let mon_h = mon.size().height as i32;
-    let (v0, v1) = if expanding { (sliver_w, full_w) } else { (full_w, sliver_w) };
-    for step in 1..=ANIM_STEPS {
-        let t = step as f64 / ANIM_STEPS as f64;
-        let eased = 1.0 - (1.0 - t) * (1.0 - t); // easeOutQuad
-        let v = (v0 as f64 + (v1 - v0) as f64 * eased).round() as i32;
-        let x = if side_left { mon_x } else { mon_x + mon_w - v };
-        // 先收窄裁剪区域再挪窗口：反过来会在两步之间留出"宽区域+新位置"
-        // 的一帧，双屏接缝处会把面板内容溅到相邻屏上
-        clip_region(win, 0, v, mon_h);
-        let _ = win.set_position(PhysicalPosition::new(x, mon_y));
-        thread::sleep(Duration::from_millis(FRAME_MS));
-    }
-    let x_end = if side_left { mon_x } else { mon_x + mon_w - v1 };
-    let _ = win.set_position(PhysicalPosition::new(x_end, mon_y));
+    let (mon_x, mon_y) = (mon.position().x, mon.position().y);
+    let (mon_w, mon_h) = (mon.size().width as i32, mon.size().height as i32);
+    let full_x = if side_left { mon_x } else { mon_x + mon_w - full_w };
+
+    let reveal = |v: i32| {
+        if side_left {
+            clip_region(win, 0, v, mon_h)
+        } else {
+            clip_region(win, full_w - v, full_w, mon_h)
+        }
+    };
+
     if expanding {
+        // 整窗遮住后摆到展开位（先挪位后放尺寸，中间态不出屏）
+        clip_region(win, if side_left { 0 } else { full_w }, if side_left { 0 } else { full_w }, mon_h);
+        let _ = win.set_position(PhysicalPosition::new(full_x, mon_y));
+        let _ = win.set_size(PhysicalSize::new(full_w as u32, mon_h as u32));
+        for step in 1..=ANIM_STEPS {
+            let t = step as f64 / ANIM_STEPS as f64;
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let v = (sliver_w as f64 + (full_w - sliver_w) as f64 * eased).round() as i32;
+            reveal(v);
+            thread::sleep(Duration::from_millis(FRAME_MS));
+        }
         clear_region(win);
+        redraw_window(win);
     } else {
-        clip_region(win, 0, v1, mon_h);
+        for step in 1..=ANIM_STEPS {
+            let t = step as f64 / ANIM_STEPS as f64;
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let v = (full_w as f64 + (sliver_w - full_w) as f64 * eased).round() as i32;
+            reveal(v);
+            thread::sleep(Duration::from_millis(FRAME_MS));
+        }
+        // 内容已隐藏：物理收窄贴边（先缩后挪，中间态不出屏）
+        let edge_x = if side_left { mon_x } else { mon_x + mon_w - sliver_w };
+        let _ = win.set_size(PhysicalSize::new(sliver_w as u32, mon_h as u32));
+        let _ = win.set_position(PhysicalPosition::new(edge_x, mon_y));
+        clear_region(win);
     }
 }
 
@@ -468,14 +494,18 @@ pub fn show_expanded(app: &AppHandle, focus: bool) {
     if let Some(win) = app.get_webview_window(WIN_LABEL) {
         if let Some(mon) = monitor_of_window(app, &win).or_else(|| app.primary_monitor().ok().flatten()) {
             let d = app.state::<Dock>().inner();
-            let full_w = ensure_full_size(&d, &win, &mon);
+            let width_l = d.width_l.load(Ordering::Relaxed) as f64;
+            let full_w = ((width_l * mon.scale_factor()).round() as i32).max(1);
             let side_left = d.side_left.load(Ordering::Relaxed);
             let mon_x = mon.position().x;
             let mon_y = mon.position().y;
             let mon_w = mon.size().width as i32;
             let x = if side_left { mon_x } else { mon_x + mon_w - full_w };
+            // 从隐藏/收起状态唤出：先挪到展开位再放尺寸（中间态不出屏），取消区域并强制重绘
             let _ = win.set_position(PhysicalPosition::new(x, mon_y));
+            let _ = win.set_size(PhysicalSize::new(full_w as u32, mon.size().height));
             clear_region(&win);
+            redraw_window(&win);
         }
         let _ = win.show();
         if focus {
@@ -513,12 +543,14 @@ pub fn set_dock_side(app: &AppHandle, side_left: bool) {
                     place_sliver(&d, &win, &mon, sliver);
                 }
                 _ => {
-                    let full_w = ensure_full_size(&d, &win, &mon);
+                    let width_l = d.width_l.load(Ordering::Relaxed) as f64;
+                    let full_w = ((width_l * mon.scale_factor()).round() as i32).max(1);
                     let mon_x = mon.position().x;
                     let mon_y = mon.position().y;
                     let mon_w = mon.size().width as i32;
                     let x = if side_left { mon_x } else { mon_x + mon_w - full_w };
                     let _ = win.set_position(PhysicalPosition::new(x, mon_y));
+                    let _ = win.set_size(PhysicalSize::new(full_w as u32, mon.size().height));
                     clear_region(&win);
                 }
             }
@@ -549,17 +581,17 @@ pub fn set_width(app: &AppHandle, logical: f64) {
     d.width_l.store(logical.round() as u32, Ordering::Relaxed);
     if let Some(win) = app.get_webview_window(WIN_LABEL) {
         if let Some(mon) = monitor_of_window(app, &win) {
-            let w = ((logical * mon.scale_factor()).round() as u32).max(1);
-            let _ = win.set_size(PhysicalSize::new(w, mon.size().height));
+            let side_left = d.side_left.load(Ordering::Relaxed);
+            let w = ((logical * mon.scale_factor()).round() as i32).max(1);
+            let mon_x = mon.position().x;
+            let mon_y = mon.position().y;
+            let mon_w = mon.size().width as i32;
             match { *dock(app) } {
                 DockState::Expanded => {
-                    let side_left = d.side_left.load(Ordering::Relaxed);
-                    let mon_x = mon.position().x;
-                    let mon_y = mon.position().y;
-                    let mon_w = mon.size().width as i32;
-                    let x = if side_left { mon_x } else { mon_x + mon_w - w as i32 };
+                    // 先挪到新宽度对应的位置再改尺寸（中间态不出屏）
+                    let x = if side_left { mon_x } else { mon_x + mon_w - w };
                     let _ = win.set_position(PhysicalPosition::new(x, mon_y));
-                    clear_region(&win);
+                    let _ = win.set_size(PhysicalSize::new(w as u32, mon.size().height));
                 }
                 DockState::Retracted => {
                     let sliver = d.sliver.load(Ordering::Relaxed);

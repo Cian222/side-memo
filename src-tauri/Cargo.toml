@@ -1,6 +1,6 @@
 [package]
 name = "side-memo"
-version = "0.13.4"
+version = "0.14.0"
 edition = "2021"
 description = "侧边备忘录 - 贴边滑出的桌面便签"
 
